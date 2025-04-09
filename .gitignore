@@ -1,0 +1,9 @@
+/.venv
+/data
+*.h5
+
+# python cache and compiled files
+**.pyc
+**.pyo
+**.pyd
+__pycache__/
