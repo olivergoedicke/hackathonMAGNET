@@ -118,174 +118,204 @@ class AdamTorchOptimizer(BaseOptimizer):
 
     def optimize(self, simulation: Simulation) -> CoilConfig:
         overall_start_time = time.time()
-
-        # --- Initial Configuration Evaluation ---+
-        best_initial_config_np = None
-        # Use internal objective sense (minimization) for tracking best initial cost
-        best_initial_internal_cost = float('inf')
+        overall_best_config = None
+        overall_best_internal_cost = float('inf')
         initial_cost_better = (lambda current, best: current < best) # Using internal cost (minimization)
+        outer_run_count = 0
 
-        print(f"Evaluating {self.num_inits} initial random configurations...")
-        pbar_init = trange(self.num_inits, desc="Initial Evaluation", leave=False)
-        initial_eval_timeout = False
-        for init_run in pbar_init:
-            # Check overall timeout during initial evaluation
-            if time.time() - overall_start_time > self.timeout:
-                pbar_init.close()
-                print(f"\nTimeout ({self.timeout}s) occurred during initial configuration evaluation.")
-                initial_eval_timeout = True
+        print(f"Starting repeated optimization cycles (batch_size={self.num_inits}, steps_per_batch={self.max_iter})")
+
+        while time.time() - overall_start_time < self.timeout:
+            outer_run_count += 1
+            print(f"--- Outer Optimization Cycle {outer_run_count} ---")
+            cycle_start_time = time.time()
+
+            # --- Initial Configuration Evaluation (for this cycle) ---+
+            best_initial_config_np_cycle = None
+            best_initial_internal_cost_cycle = float('inf')
+
+            print(f"  Evaluating {self.num_inits} initial random configurations for cycle {outer_run_count}...")
+            pbar_init = trange(self.num_inits, desc=f"Cycle {outer_run_count} Init Eval", leave=False)
+            initial_eval_timed_out_cycle = False
+            for _ in pbar_init:
+                # Check overall timeout *before* evaluation
+                if time.time() - overall_start_time >= self.timeout:
+                    pbar_init.close()
+                    print(f"\nTimeout ({self.timeout}s) occurred during initial evaluation of cycle {outer_run_count}.")
+                    initial_eval_timed_out_cycle = True
+                    break
+
+                # Generate random configuration (NumPy)
+                initial_phase_np = np.random.uniform(0, 2 * np.pi, size=(8,))
+                initial_amplitude_np = np.random.uniform(0, 1, size=(8,))
+
+                # Evaluate its cost
+                try:
+                    current_initial_internal_cost = self._objective_function(simulation, initial_phase_np, initial_amplitude_np)
+
+                    if initial_cost_better(current_initial_internal_cost, best_initial_internal_cost_cycle):
+                        best_initial_internal_cost_cycle = current_initial_internal_cost
+                        best_initial_config_np_cycle = (initial_phase_np, initial_amplitude_np)
+                        # Display actual cost based on direction for this cycle's best init
+                        best_initial_display_cost_cycle = -best_initial_internal_cost_cycle if self.direction == "maximize" else best_initial_internal_cost_cycle
+                        pbar_init.set_postfix_str(f"Best init cost {best_initial_display_cost_cycle:.4f}")
+
+                except Exception as e:
+                    # print(f"Warning: Error evaluating initial config in cycle {outer_run_count}: {e}")
+                    pass # Continue to next initial config
+
+            if not pbar_init.disable:
+                 pbar_init.close()
+
+            # If timeout occurred during initial eval, break the outer loop
+            if initial_eval_timed_out_cycle:
                 break
 
-            # Generate random configuration (NumPy)
-            initial_phase_np = np.random.uniform(0, 2 * np.pi, size=(8,))
-            initial_amplitude_np = np.random.uniform(0, 1, size=(8,))
+            if best_initial_config_np_cycle is None:
+                print(f"\nWarning: Failed to find any valid initial configuration in cycle {outer_run_count}. Skipping to next cycle.")
+                # Check timeout before continuing to potentially avoid infinite loop if objective always fails
+                if time.time() - overall_start_time >= self.timeout:
+                    print("Timeout reached after failed initial evaluation phase.")
+                    break
+                continue # Skip optimization phase for this cycle
 
-            # Evaluate its cost
+            # --- Start Optimization from Best Initial Configuration (for this cycle) ---+
+            best_initial_phase_np_cycle, best_initial_amplitude_np_cycle = best_initial_config_np_cycle
+            best_initial_display_cost_cycle = -best_initial_internal_cost_cycle if self.direction == "maximize" else best_initial_internal_cost_cycle
+            print(f"  Starting optimization for cycle {outer_run_count} from initial cost: {best_initial_display_cost_cycle:.4f}")
+
+            # Convert the cycle's best initial parameters to torch tensors
+            phase = torch.tensor(best_initial_phase_np_cycle, dtype=torch.float32, device=self.device, requires_grad=True)
+            amplitude = torch.tensor(best_initial_amplitude_np_cycle, dtype=torch.float32, device=self.device, requires_grad=True)
+
+            # Setup Adam optimizer for this cycle
+            optimizer = torch.optim.Adam([phase, amplitude],
+                                         lr=self.learning_rate,
+                                         betas=self.betas,
+                                         eps=self.eps)
+
+            # Track best cost found *during this cycle's optimization run*
+            # Initialize with the cost of the starting point for this cycle
+            run_best_internal_cost_cycle = best_initial_internal_cost_cycle
+            run_best_config_cycle = CoilConfig(phase=best_initial_phase_np_cycle.copy(), amplitude=best_initial_amplitude_np_cycle.copy())
+
+            # --- Optimization Loop (for this cycle) ---
+            optimization_timed_out_cycle = False
             try:
-                current_initial_internal_cost = self._objective_function(simulation, initial_phase_np, initial_amplitude_np)
+                pbar = trange(self.max_iter, desc=f"Cycle {outer_run_count} Opt Run", leave=False)
+                for i in pbar:
+                    # Check overall timeout at the start of each iteration
+                    if time.time() - overall_start_time >= self.timeout:
+                        pbar.close()
+                        print(f"\nTimeout ({self.timeout}s) occurred during optimization step {i} of cycle {outer_run_count}.")
+                        optimization_timed_out_cycle = True
+                        break
 
-                if initial_cost_better(current_initial_internal_cost, best_initial_internal_cost):
-                    best_initial_internal_cost = current_initial_internal_cost
-                    best_initial_config_np = (initial_phase_np, initial_amplitude_np)
-                    # Display actual cost based on direction
-                    best_initial_display_cost = -best_initial_internal_cost if self.direction == "maximize" else best_initial_internal_cost
-                    pbar_init.set_postfix_str(f"Best initial cost {best_initial_display_cost:.4f}")
+                    # Get current parameters as numpy arrays
+                    current_phase_np = phase.detach().cpu().numpy()
+                    current_amplitude_np = amplitude.detach().cpu().numpy()
 
+                    # --- Calculate Numerical Gradients ---
+                    phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
+                        simulation, current_phase_np, current_amplitude_np
+                    )
+                    # Check timeout *after* gradient calculation
+                    if time.time() - overall_start_time >= self.timeout:
+                        pbar.close()
+                        print(f"\nTimeout ({self.timeout}s) occurred after gradient calc in step {i} of cycle {outer_run_count}.")
+                        optimization_timed_out_cycle = True
+                        break
+
+                    # --- Manually Assign Gradients to Tensors ---
+                    with torch.no_grad():
+                        phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
+                        amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+
+                    # --- Optimizer Step ---
+                    if phase.grad is not None and amplitude.grad is not None:
+                        optimizer.step() # Apply Adam update
+                    else:
+                        print(f"\nWarning: Gradients are None at iter {i} in cycle {outer_run_count}. Skipping optimizer step.")
+
+                    # Zero gradients *after* the step
+                    optimizer.zero_grad()
+
+                    # --- Apply Constraints to Tensors ---
+                    with torch.no_grad():
+                        phase.data = torch.remainder(phase.data, 2 * np.pi)
+                        amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
+
+                    # --- Evaluate Current Cost and Update Cycle Best ---
+                    eval_phase_np = phase.detach().cpu().numpy()
+                    eval_amplitude_np = amplitude.detach().cpu().numpy()
+                    current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
+                    # Check timeout *after* cost evaluation
+                    if time.time() - overall_start_time >= self.timeout:
+                        pbar.close()
+                        print(f"\nTimeout ({self.timeout}s) occurred after cost eval in step {i} of cycle {outer_run_count}.")
+                        optimization_timed_out_cycle = True
+                        break
+
+                    # Update the best cost found *during this cycle's run*
+                    if initial_cost_better(current_internal_cost, run_best_internal_cost_cycle):
+                        run_best_internal_cost_cycle = current_internal_cost
+                        run_best_config_cycle = CoilConfig(phase=eval_phase_np.copy(), amplitude=eval_amplitude_np.copy())
+
+                        # Update display cost for progress bar for this cycle
+                        run_best_display_cost_cycle = -run_best_internal_cost_cycle if self.direction == "maximize" else run_best_internal_cost_cycle
+                        current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np))) if phase_grad_np is not None and amp_grad_np is not None else float('nan')
+                        pbar.set_postfix_str(f"Cycle best cost {run_best_display_cost_cycle:.4f}, Grad norm {current_grad_norm:.2e}")
+
+                # End of optimization loop (max_iter or timeout break)
+                if not pbar.disable:
+                     pbar.close()
+
+            except TimeoutError as e: # Should be caught by inner checks, but as safety
+                print(f"\nTimeoutError during optimization run of cycle {outer_run_count}: {str(e)}")
+                optimization_timed_out_cycle = True # Ensure we check overall best below
+                if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
+                    pbar.close()
             except Exception as e:
-                # Silently ignore errors during initial eval? Or print warning?
-                # print(f"Warning: Error evaluating initial config {init_run+1}: {e}")
-                pass # Continue to next initial config
-
-        if not pbar_init.disable:
-            pbar_init.close()
-
-        if best_initial_config_np is None:
-            print("\nWarning: Failed to find any valid initial configuration.")
-            if initial_eval_timeout:
-                 print("Optimization stopped due to timeout during initial evaluation.")
-            else:
-                 print("No valid configurations found within the initial set.")
-            return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,))) # Return default
-
-        # --- Start Optimization from Best Initial Configuration ---+
-        best_initial_phase_np, best_initial_amplitude_np = best_initial_config_np
-        best_initial_display_cost = -best_initial_internal_cost if self.direction == "maximize" else best_initial_internal_cost
-        print(f"\nStarting optimization from best initial configuration (Cost: {best_initial_display_cost:.4f})")
-
-        # Convert the *best* initial parameters to torch tensors
-        phase = torch.tensor(best_initial_phase_np, dtype=torch.float32, device=self.device, requires_grad=True)
-        amplitude = torch.tensor(best_initial_amplitude_np, dtype=torch.float32, device=self.device, requires_grad=True)
-
-        # Setup Adam optimizer *once*
-        optimizer = torch.optim.Adam([phase, amplitude],
-                                     lr=self.learning_rate,
-                                     betas=self.betas,
-                                     eps=self.eps)
-
-        # Track best cost found *during this optimization run*
-        # Initialize with the cost of the starting point
-        run_best_internal_cost = best_initial_internal_cost
-        run_best_config = CoilConfig(phase=best_initial_phase_np.copy(), amplitude=best_initial_amplitude_np.copy())
-
-        # --- Optimization Loop (Single Run) ---
-        optimization_timed_out = False
-        try:
-            pbar = trange(self.max_iter, desc="Optimization Run", leave=False)
-            for i in pbar:
-                # Check overall timeout at the start of each iteration
-                if time.time() - overall_start_time > self.timeout:
+                print(f"\nError occurred during optimization run of cycle {outer_run_count}: {e}")
+                if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
                     pbar.close()
-                    print(f"\nOptimization stopped during iteration {i} due to overall timeout ({self.timeout} seconds)")
-                    optimization_timed_out = True
-                    break
+                # run_best_config_cycle might still hold the best state before the error
 
-                # Get current parameters as numpy arrays for gradient calculation
-                current_phase_np = phase.detach().cpu().numpy()
-                current_amplitude_np = amplitude.detach().cpu().numpy()
+            # --- Update Overall Best After Cycle ---+
+            if run_best_config_cycle is not None:
+                # Compare this cycle's best internal cost with the overall best
+                if initial_cost_better(run_best_internal_cost_cycle, overall_best_internal_cost):
+                    overall_best_internal_cost = run_best_internal_cost_cycle
+                    overall_best_config = run_best_config_cycle # Store the actual best CoilConfig object from the cycle
+                    overall_best_display_cost = -overall_best_internal_cost if self.direction == "maximize" else overall_best_internal_cost
+                    print(f"  *** New overall best cost found: {overall_best_display_cost:.4f} in cycle {outer_run_count} ***")
 
-                # --- Calculate Numerical Gradients ---
-                phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
-                    simulation, current_phase_np, current_amplitude_np
-                )
-                # Check timeout *after* gradient calculation
-                if time.time() - overall_start_time > self.timeout:
-                    pbar.close()
-                    print(f"\nOptimization stopped during iteration {i} due to overall timeout ({self.timeout} seconds) after gradient calc")
-                    optimization_timed_out = True
-                    break
+            # Ensure the outer loop terminates if a timeout occurred anywhere in the cycle
+            if initial_eval_timed_out_cycle or optimization_timed_out_cycle:
+                 print(f"Terminating outer loop due to timeout during cycle {outer_run_count}.")
+                 break
 
-                # --- Manually Assign Gradients to Tensors ---
-                with torch.no_grad():
-                    phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
-                    amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+            # Optional: Print time taken for cycle
+            cycle_duration = time.time() - cycle_start_time
+            print(f"  Cycle {outer_run_count} duration: {cycle_duration:.2f}s")
 
-                # --- Optimizer Step ---
-                if phase.grad is not None and amplitude.grad is not None:
-                    optimizer.step() # Apply Adam update
-                else:
-                    print(f"\nWarning: Gradients are None at iter {i}. Skipping optimizer step.")
+        # --- End of Outer Loop ---+
 
-                # Zero gradients *after* the step
-                optimizer.zero_grad()
-
-                # --- Apply Constraints to Tensors ---
-                with torch.no_grad():
-                    phase.data = torch.remainder(phase.data, 2 * np.pi)
-                    amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
-
-                # --- Evaluate Current Cost and Update Run Best ---
-                eval_phase_np = phase.detach().cpu().numpy()
-                eval_amplitude_np = amplitude.detach().cpu().numpy()
-                current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
-                # Check timeout *after* cost evaluation
-                if time.time() - overall_start_time > self.timeout:
-                    pbar.close()
-                    print(f"\nOptimization stopped during iteration {i} due to overall timeout ({self.timeout} seconds) after cost eval")
-                    optimization_timed_out = True
-                    break
-
-                # Update the best cost found *during this run*
-                if initial_cost_better(current_internal_cost, run_best_internal_cost):
-                    run_best_internal_cost = current_internal_cost
-                    run_best_config = CoilConfig(phase=eval_phase_np.copy(), amplitude=eval_amplitude_np.copy())
-
-                    # Update display cost for progress bar
-                    run_best_display_cost = -run_best_internal_cost if self.direction == "maximize" else run_best_internal_cost
-                    current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np))) if phase_grad_np is not None and amp_grad_np is not None else float('nan')
-                    pbar.set_postfix_str(f"Best cost {run_best_display_cost:.4f}, Grad norm {current_grad_norm:.2e}")
-
-            # End of optimization loop (max_iter or timeout break)
-            if not pbar.disable:
-                 pbar.close()
-
-        except TimeoutError as e: # Should be caught by inner checks, but as safety
-            print(f"\nTimeout occurred during optimization run: {str(e)}")
-            optimization_timed_out = True
-            if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
-                pbar.close()
-        except Exception as e:
-            print(f"\nError occurred during optimization run: {e}")
-            if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
-                pbar.close()
-            # Depending on the error, we might still have a valid config in run_best_config
-
-        # --- Return Best Found Configuration ---
-        # Return the best configuration found during *this single optimization run*
-        run_final_display_cost = -run_best_internal_cost if self.direction == "maximize" else run_best_internal_cost
-        print(f"--- Optimization finished. Best cost found: {run_final_display_cost:.4f} ---")
-
-        # Final check for NaNs in the result
-        if run_best_config is not None:
-             # Final check for NaNs in the absolute best result
-             if np.isnan(run_best_config.phase).any() or np.isnan(run_best_config.amplitude).any():
-                  print("\nWarning: Final parameters contain NaN. This might indicate issues during optimization.")
-                   # Decide recovery strategy: return default? or the possibly NaN result?
-                   # Returning default for safety:
-                  print("\nReturning default zero configuration due to NaNs in result.")
-                  return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,))) 
-             return run_best_config
+        # --- Return Overall Best Found Configuration ---+
+        print("\n--- Repeated optimization finished. --- ")
+        if overall_best_config is not None:
+            overall_final_display_cost = -overall_best_internal_cost if self.direction == "maximize" else overall_best_internal_cost
+            print(f"Overall best cost found across {outer_run_count} cycles: {overall_final_display_cost:.4f}")
+            # Final check for NaNs in the absolute best result
+            if np.isnan(overall_best_config.phase).any() or np.isnan(overall_best_config.amplitude).any():
+                print("\nWarning: Overall best parameters contain NaN. This might indicate issues during optimization.")
+                # Decide recovery strategy: return default? or the possibly NaN result?
+                # Returning default for safety:
+                print("\nReturning default zero configuration due to NaNs in overall best result.")
+                return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,)))
+            # If no NaNs, return the best config found
+            return overall_best_config
         else:
-             # This should technically not happen if we start from a valid best_initial_config
-             # but as a safeguard:
-             print("\nWarning: Optimization run did not produce a valid configuration result.")
-             return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,)))
+            # If no valid config was ever found across all cycles
+            print("\nWarning: Optimization failed to find any valid configuration across all cycles.")
+            return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,)))
