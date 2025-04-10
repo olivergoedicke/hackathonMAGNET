@@ -96,7 +96,7 @@ class GradientDescentOptimizer(BaseOptimizer):
         best_overall_config = None
         best_overall_cost = -np.inf if self.direction == "maximize" else np.inf
         
-        num_initializations = 10  # Number of random initializations
+        num_initializations = 300  # Number of random initializations
         
         print(f"Running {num_initializations} random initializations...")
         init_pbar = trange(num_initializations, desc="Initializations")
