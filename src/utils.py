@@ -42,8 +42,8 @@ def evaluate_coil_config(coil_config: CoilConfig,
     # Create a dictionary to store the results, converting numpy types
     result = {
         # Convert numpy arrays to lists
-        "best_coil_phase": list(coil_config.phase),
-        "best_coil_amplitude": list(coil_config.amplitude),
+        "best_coil_phase": [float(p) for p in coil_config.phase],
+        "best_coil_amplitude": [float(a) for a in coil_config.amplitude],
         # Explicitly convert cost values to standard Python floats
         "best_coil_config_cost": float(best_coil_config_cost),
         "default_coil_config_cost": float(default_coil_config_cost),

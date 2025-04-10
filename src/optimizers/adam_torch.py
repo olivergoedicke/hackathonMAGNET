@@ -26,6 +26,7 @@ class AdamTorchOptimizer(BaseOptimizer):
                  eps: float = 1e-8,        # Adam epsilon
                  grad_epsilon: float = 1e-6, # Epsilon for numerical gradient calculation
                  timeout: float = 300,     # 5 minutes
+                 num_inits: int = 300,       # Number of random initializations
                  device: str | None = None) -> None:
         super().__init__(cost_function)
         self.max_iter = max_iter
@@ -34,6 +35,7 @@ class AdamTorchOptimizer(BaseOptimizer):
         self.eps = eps
         self.grad_epsilon = grad_epsilon # Epsilon for numerical gradient
         self.timeout = timeout
+        self.num_inits = num_inits
 
         # --- Device Selection ---
         if device:
@@ -115,103 +117,175 @@ class AdamTorchOptimizer(BaseOptimizer):
         return phase_grad, amp_grad
 
     def optimize(self, simulation: Simulation) -> CoilConfig:
-        start_time = time.time()
+        overall_start_time = time.time()
+        overall_best_config = None
+        # Use internal objective sense (minimization) for tracking best cost
+        overall_best_internal_cost = float('inf')
 
-        # --- Initialization ---
-        initial_phase = np.random.uniform(0, 2 * np.pi, size=(8,))
-        initial_amplitude = np.ones((8,)) # Start amplitude at 1
+        print(f"Starting Adam (Torch) optimization with {self.num_inits} initializations...")
 
-        # Convert initial parameters to torch tensors
-        phase = torch.tensor(initial_phase, dtype=torch.float32, device=self.device)
-        amplitude = torch.tensor(initial_amplitude, dtype=torch.float32, device=self.device)
-        # Ensure they require grad for the optimizer state, even if we set .grad manually
-        phase.requires_grad_(True)
-        amplitude.requires_grad_(True)
-
-
-        # Setup Adam optimizer
-        optimizer = torch.optim.Adam([phase, amplitude],
-                                     lr=self.learning_rate,
-                                     betas=self.betas,
-                                     eps=self.eps)
-
-        # --- Initial Evaluation ---
-        best_phase_np = phase.detach().cpu().numpy()
-        best_amplitude_np = amplitude.detach().cpu().numpy()
-        # Use the objective function which handles min/max direction internally
-        best_internal_cost = self._objective_function(simulation, best_phase_np, best_amplitude_np)
-
-        if np.isinf(best_internal_cost):
-             print("Error: Initial configuration yields invalid cost. Returning initial guess.")
-             # Return the initial numpy arrays in a CoilConfig
-             return CoilConfig(phase=initial_phase, amplitude=initial_amplitude)
-
-        # Store the display cost (actual cost according to min/max direction)
-        best_display_cost = -best_internal_cost if self.direction == "maximize" else best_internal_cost
-        print(f"Initial cost: {best_display_cost:.4f}")
-
-
-        # --- Optimization Loop ---
-        pbar = trange(self.max_iter)
-        for i in pbar:
-            if time.time() - start_time > self.timeout:
-                print(f"\nOptimization stopped due to timeout ({self.timeout}s)")
+        overall_timeout_reached = False
+        for init_run in range(self.num_inits):
+            if overall_timeout_reached:
                 break
 
-            # Get current parameters as numpy arrays for gradient calculation
-            current_phase_np = phase.detach().cpu().numpy()
-            current_amplitude_np = amplitude.detach().cpu().numpy()
+            print(f"--- Initialization Run {init_run + 1}/{self.num_inits} ---")
 
-            # --- Calculate Numerical Gradients ---
-            phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
-                simulation, current_phase_np, current_amplitude_np
-            )
+            # Check overall timeout before starting a new run
+            if time.time() - overall_start_time > self.timeout:
+                print(f"\nOverall optimization stopped due to timeout ({self.timeout} seconds) before starting run {init_run + 1}.")
+                overall_timeout_reached = True
+                break
 
-            # --- Manually Assign Gradients to Tensors ---
-            with torch.no_grad(): # Ensure this operation isn't tracked
-                phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
-                amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+            run_best_config = None
+            run_best_internal_cost = float('inf')
+            run_timed_out = False
 
-            # --- Optimizer Step ---
-            # Checks if gradients exist before stepping
-            if phase.grad is not None and amplitude.grad is not None:
-                optimizer.step() # Apply Adam update using the manually assigned gradients
+            try:
+                # --- Initialization for this run ---
+                initial_phase_run = np.random.uniform(0, 2 * np.pi, size=(8,))
+                initial_amplitude_run = np.random.uniform(0, 1, size=(8,)) # Random amplitude init
+
+                # Check timeout after initialization
+                if time.time() - overall_start_time > self.timeout:
+                    raise TimeoutError("Overall timeout reached during initialization")
+
+                # Convert initial parameters to torch tensors for this run
+                phase = torch.tensor(initial_phase_run, dtype=torch.float32, device=self.device, requires_grad=True)
+                amplitude = torch.tensor(initial_amplitude_run, dtype=torch.float32, device=self.device, requires_grad=True)
+
+                # Setup Adam optimizer for this run
+                optimizer = torch.optim.Adam([phase, amplitude],
+                                             lr=self.learning_rate,
+                                             betas=self.betas,
+                                             eps=self.eps)
+
+                # --- Initial Evaluation for this run ---
+                current_phase_np = phase.detach().cpu().numpy()
+                current_amplitude_np = amplitude.detach().cpu().numpy()
+                current_internal_cost = self._objective_function(simulation, current_phase_np, current_amplitude_np)
+
+                if np.isinf(current_internal_cost):
+                     print(f"  Warning: Initial configuration for run {init_run + 1} yields invalid cost. Skipping run.")
+                     continue # Skip to the next initialization run
+
+                run_best_internal_cost = current_internal_cost
+                run_best_config = CoilConfig(phase=current_phase_np.copy(), amplitude=current_amplitude_np.copy())
+
+                # Store the display cost (actual cost according to min/max direction)
+                initial_display_cost = -current_internal_cost if self.direction == "maximize" else current_internal_cost
+                print(f"  Initial cost for run {init_run + 1}: {initial_display_cost:.4f}")
+
+                # --- Optimization Loop for this run ---
+                pbar = trange(self.max_iter, desc=f"Run {init_run + 1}", leave=False)
+                for i in pbar:
+                    if time.time() - overall_start_time > self.timeout:
+                        pbar.close()
+                        print(f"\nOptimization stopped during run {init_run + 1} iteration {i} due to overall timeout ({self.timeout} seconds)")
+                        run_timed_out = True
+                        break # Break inner loop (iteration)
+
+                    # Get current parameters as numpy arrays for gradient calculation
+                    current_phase_np = phase.detach().cpu().numpy()
+                    current_amplitude_np = amplitude.detach().cpu().numpy()
+
+                    # --- Calculate Numerical Gradients (Check timeout inside if necessary) ---
+                    # Note: _compute_numerical_gradient calls _objective_function, which might be slow.
+                    # Timeout checks within those might be beneficial for long cost evaluations.
+                    phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
+                        simulation, current_phase_np, current_amplitude_np
+                    )
+                    # Check timeout *after* gradient calculation
+                    if time.time() - overall_start_time > self.timeout:
+                        pbar.close()
+                        print(f"\nOptimization stopped during run {init_run + 1} iteration {i} due to overall timeout ({self.timeout} seconds) after gradient calc")
+                        run_timed_out = True
+                        break
+
+                    # --- Manually Assign Gradients to Tensors ---
+                    with torch.no_grad(): # Ensure this operation isn't tracked
+                        phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
+                        amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+
+                    # --- Optimizer Step ---
+                    if phase.grad is not None and amplitude.grad is not None:
+                        optimizer.step() # Apply Adam update
+                    else:
+                        print(f"\nWarning: Gradients are None at iter {i} in run {init_run + 1}. Skipping optimizer step.")
+
+                    # Zero gradients *after* the step
+                    optimizer.zero_grad()
+
+                    # --- Apply Constraints to Tensors ---
+                    with torch.no_grad():
+                        phase.data = torch.remainder(phase.data, 2 * np.pi)
+                        amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
+
+                    # --- Evaluate Current Cost and Update Run Best ---
+                    eval_phase_np = phase.detach().cpu().numpy()
+                    eval_amplitude_np = amplitude.detach().cpu().numpy()
+                    current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
+                    # Check timeout *after* cost evaluation
+                    if time.time() - overall_start_time > self.timeout:
+                        pbar.close()
+                        print(f"\nOptimization stopped during run {init_run + 1} iteration {i} due to overall timeout ({self.timeout} seconds) after cost eval")
+                        run_timed_out = True
+                        break
+
+                    if current_internal_cost < run_best_internal_cost:
+                        run_best_internal_cost = current_internal_cost
+                        run_best_config = CoilConfig(phase=eval_phase_np.copy(), amplitude=eval_amplitude_np.copy())
+
+                        # Update display cost for progress bar
+                        run_best_display_cost = -run_best_internal_cost if self.direction == "maximize" else run_best_internal_cost
+                        current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np))) if phase_grad_np is not None and amp_grad_np is not None else float('nan')
+                        pbar.set_postfix_str(f"Best cost {run_best_display_cost:.4f}, Grad norm {current_grad_norm:.2e}")
+
+                # End of inner loop (max_iter or timeout break)
+                if not pbar.disable:
+                     pbar.close()
+                if not run_timed_out:
+                     run_final_display_cost = -run_best_internal_cost if self.direction == "maximize" else run_best_internal_cost
+                     print(f"  Run {init_run + 1} finished after {self.max_iter} iterations. Best cost for this run: {run_final_display_cost:.4f}")
+                else:
+                    overall_timeout_reached = True # Signal to stop outer loop
+
+            except TimeoutError as e:
+                 print(f"\nTimeout occurred during run {init_run + 1}: {str(e)}")
+                 overall_timeout_reached = True # Signal to stop outer loop
+                 if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
+                     pbar.close()
+            except Exception as e:
+                 print(f"\nError occurred during run {init_run + 1}: {e}")
+                 # Optionally decide if this error should stop all runs
+                 # overall_timeout_reached = True # Uncomment to stop on any error
+                 if 'pbar' in locals() and hasattr(pbar, 'close') and not pbar.disable:
+                     pbar.close()
+
+            # Compare the best result of this run with the overall best
+            if run_best_config is not None:
+                 # Use internal cost (minimization) for comparison
+                 if run_best_internal_cost < overall_best_internal_cost:
+                     overall_best_internal_cost = run_best_internal_cost
+                     overall_best_config = run_best_config
+                     overall_best_display_cost = -overall_best_internal_cost if self.direction == "maximize" else overall_best_internal_cost
+                     print(f"  *** New overall best cost found: {overall_best_display_cost:.4f} ***")
             else:
-                print(f"\nWarning: Gradients are None at iter {i}. Skipping optimizer step.")
-
-            # Zero gradients *after* the step for the next iteration
-            optimizer.zero_grad()
-
-            # --- Apply Constraints to Tensors ---
-            # Apply constraints directly to the tensors after the optimizer step
-            with torch.no_grad():
-                phase.data = torch.remainder(phase.data, 2 * np.pi)
-                amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
-
-            # --- Evaluate Current Cost and Update Best ---
-            # Evaluate with the parameters *after* step and constraints
-            eval_phase_np = phase.detach().cpu().numpy()
-            eval_amplitude_np = amplitude.detach().cpu().numpy()
-            current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
-
-            if current_internal_cost < best_internal_cost:
-                best_internal_cost = current_internal_cost
-                best_phase_np = eval_phase_np.copy()      # Store the best numpy arrays
-                best_amplitude_np = eval_amplitude_np.copy()
-
-                # Update display cost
-                best_display_cost = -best_internal_cost if self.direction == "maximize" else best_internal_cost
-                # Optionally calculate grad norm for display
-                current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np)))
-                pbar.set_postfix_str(f"Best cost {best_display_cost:.4f}, Grad norm {current_grad_norm:.2e}")
-
+                 print(f"  Run {init_run + 1} did not produce a valid result.")
 
         # --- Return Best Found Configuration ---
-        print(f"\nOptimization finished. Best cost found: {best_display_cost:.4f}")
-
-        # Final check for NaNs in results (should be less likely with constraints)
-        if np.isnan(best_phase_np).any() or np.isnan(best_amplitude_np).any():
-             print("Warning: Best parameters contain NaN. Returning initial guess.")
-             return CoilConfig(phase=initial_phase, amplitude=initial_amplitude)
-
-        return CoilConfig(phase=best_phase_np, amplitude=best_amplitude_np)
+        if overall_best_config is not None:
+             overall_final_display_cost = -overall_best_internal_cost if self.direction == "maximize" else overall_best_internal_cost
+             print(f"--- Optimization finished. Overall best cost: {overall_final_display_cost:.4f} ---")
+             # Final check for NaNs in the absolute best result
+             if np.isnan(overall_best_config.phase).any() or np.isnan(overall_best_config.amplitude).any():
+                  print("\nWarning: Overall best parameters contain NaN. This might indicate issues during optimization.")
+                  # Decide recovery strategy: return default? or the possibly NaN result?
+                  # Returning default for safety:
+                  print("\nReturning default zero configuration due to NaNs in best result.")
+                  return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,)))
+             return overall_best_config
+        else:
+             print("\nWarning: Optimization failed to find any valid configuration across all runs.")
+             # Return default config if no valid run completed
+             return CoilConfig(phase=np.zeros((8,)), amplitude=np.zeros((8,)))
