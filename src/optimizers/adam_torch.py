@@ -36,6 +36,7 @@ class AdamTorchOptimizer(BaseOptimizer):
         self.grad_epsilon = grad_epsilon # Epsilon for numerical gradient
         self.timeout = timeout
         self.num_inits = num_inits
+        self.direction = self.cost_function.direction
 
         # --- Device Selection ---
         if device:
