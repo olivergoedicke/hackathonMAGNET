@@ -1,273 +1,217 @@
+# File: src/optimizers/adam_torch.py
+
 import torch
-import torch.optim as optim
 import numpy as np
 import time
 from tqdm import trange
-from typing import Optional, Tuple
 
-# Assuming these imports work and are compatible/adaptable for PyTorch tensors
-# You might need to adjust these relative imports based on your exact structure
-try:
-    from ..data.simulation import Simulation, CoilConfig # Adjust path if needed
-    from ..costs.base import BaseCost                 # Adjust path if needed
-    from .base import BaseOptimizer                   # Adjust path if needed
-except ImportError:
-    # Fallback for potential execution context issues, adjust as necessary
-    from src.data.simulation import Simulation, CoilConfig
-    from src.costs.base import BaseCost
-    from src.optimizers.base import BaseOptimizer
+from ..data.simulation import Simulation
+from ..data.dataclasses import CoilConfig
+from ..costs.base import BaseCost
+from .base import BaseOptimizer
 
-
-class AdamOptimizerTorch(BaseOptimizer):
+class AdamTorchOptimizer(BaseOptimizer):
     """
-    AdamOptimizerTorch uses PyTorch's Adam optimizer with multiple initializations.
+    Optimizes coil configurations using the Adam optimizer from PyTorch.
 
-    It first runs several random initializations, evaluates their initial cost,
-    and then starts the Adam optimization process from the best-performing
-    initial configuration.
-
-    **Crucial Assumption:** This implementation assumes that the `simulation` object's
-    call method (`simulation(...)`) and the `cost_function` object's call method
-    can handle PyTorch tensors for `phase` and `amplitude` within a `CoilConfig`
-    (or be adapted to work with them directly) and are differentiable using
-    PyTorch's autograd mechanism. The `cost_function` must return a scalar tensor loss.
-    If this is not the case, you would need to compute gradients numerically
-    (like in GradientDescentOptimizer) and manually apply the Adam update rule,
-    or adapt your simulation/cost function code.
+    Uses NUMERICAL GRADIENTS because the underlying simulation and cost
+    functions are not implemented in PyTorch. The Adam update rule is
+    applied using these numerical gradients.
     """
     def __init__(self,
                  cost_function: BaseCost,
                  max_iter: int = 100,
-                 learning_rate: float = 0.001, # Default Adam LR is often smaller
-                 betas: Tuple[float, float] = (0.9, 0.999),
-                 eps: float = 1e-8,
-                 timeout: float = 300, # 5 minutes
-                 num_initializations: int = 10,
-                 device: str = 'cpu') -> None:
-        """
-        Initializes the AdamOptimizerTorch.
-
-        Args:
-            cost_function: The cost function to optimize. Must have a 'direction'
-                           attribute ('minimize' or 'maximize') and be callable.
-            max_iter: Maximum number of optimization iterations.
-            learning_rate: Learning rate for the Adam optimizer.
-            betas: Coefficients used for computing running averages of gradient
-                   and its square in Adam.
-            eps: Term added to the denominator to improve numerical stability in Adam.
-            timeout: Maximum time allowed for the entire optimization process (seconds).
-            num_initializations: Number of random configurations to try before
-                                 starting the main optimization.
-            device: The torch device to run computations on ('cpu' or 'cuda').
-        """
+                 learning_rate: float = 0.01,
+                 betas: tuple[float, float] = (0.9, 0.999),
+                 eps: float = 1e-8,        # Adam epsilon
+                 grad_epsilon: float = 1e-6, # Epsilon for numerical gradient calculation
+                 timeout: float = 300,     # 5 minutes
+                 device: str | None = None) -> None:
         super().__init__(cost_function)
         self.max_iter = max_iter
         self.learning_rate = learning_rate
         self.betas = betas
         self.eps = eps
+        self.grad_epsilon = grad_epsilon # Epsilon for numerical gradient
         self.timeout = timeout
-        self.num_initializations = num_initializations
-        self.device = torch.device(device)
 
-        cost_direction = getattr(self.cost_function, 'direction', 'minimize')
-        if not isinstance(cost_direction, str) or cost_direction not in ['minimize', 'maximize']:
-             raise ValueError("Cost function must have a 'direction' attribute ('minimize' or 'maximize').")
-        self.direction = cost_direction
-        print(f"AdamOptimizerTorch initialized. Optimizing to {self.direction} cost.")
-        print(f"Device: {self.device}")
+        # --- Device Selection ---
+        if device:
+            self.device = torch.device(device)
+        else:
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"AdamTorchOptimizer using device: {self.device}")
 
-
-    def optimize(self, simulation: Simulation) -> Optional[CoilConfig]:
-        """
-        Optimizes the coil configuration using Adam after evaluating multiple initializations.
-
-        Args:
-            simulation: The simulation environment. Must have a `coil_system.num_coils`
-                        attribute and its call method must be compatible with PyTorch tensors.
-
-        Returns:
-            The best CoilConfig found (with NumPy arrays), or None if optimization
-            failed, timed out before finding a valid start, or encountered errors.
-        """
-        start_time = time.time()
-        best_initial_config_tensors: Optional[Tuple[torch.Tensor, torch.Tensor]] = None
-        best_initial_cost: float = -np.inf if self.direction == "maximize" else np.inf
-
+    def _objective_function(self, simulation: Simulation, phase_np: np.ndarray, amplitude_np: np.ndarray) -> float:
+        """ Evaluates the cost function for a given numpy configuration. """
         try:
-            num_coils = simulation.coil_system.num_coils # Get number of coils
-        except AttributeError:
-             print("Error: Simulation object must have 'coil_system.num_coils' attribute.")
-             return None
+            # Apply constraints before evaluation - important!
+            phase_np_constrained = np.mod(phase_np, 2 * np.pi)
+            amplitude_np_constrained = np.clip(amplitude_np, 0, 1)
 
-        # --- Initialization Phase ---
-        print(f"Running {self.num_initializations} random initializations...")
-        init_pbar = trange(self.num_initializations, desc="Initializations", leave=False)
-        initialization_timeout = False
-        successful_inits = 0
-        for _ in init_pbar:
-            if time.time() - start_time > self.timeout:
-                init_pbar.close()
-                print("\nTimeout occurred during initialization phase.")
-                initialization_timeout = True
-                break
+            config = CoilConfig(phase=phase_np_constrained, amplitude=amplitude_np_constrained)
+            cost = self.cost_function(simulation(config))
 
-            # Initialize parameters as PyTorch tensors
-            # Use torch.pi which is more standard than np.pi in torch contexts
-            phase_init = torch.rand(num_coils, device=self.device, dtype=torch.float32) * 2 * torch.pi
-            amp_init = torch.rand(num_coils, device=self.device, dtype=torch.float32)
+            # Handle maximization vs minimization for internal objective
+            cost_value = float(cost) # Ensure standard float
+            if self.direction == "maximize":
+                cost_value = -cost_value
 
-            # --- Evaluate Initial Cost ---
-            # This requires simulation & cost_function to work even without gradients.
-            # We use no_grad context as gradients are not needed for selection.
-            try:
-                 with torch.no_grad():
-                     # Pass tensors directly if CoilConfig/Simulation supports it.
-                     # Otherwise, conversion might be needed (less ideal).
-                     # Assuming direct tensor support here for clarity:
-                     temp_config = CoilConfig(phase=phase_init, amplitude=amp_init)
-                     sim_data = simulation(temp_config) # Must return structure cost_fn expects
-                     initial_cost_tensor = self.cost_function(sim_data) # Must return scalar tensor
+            # Return infinity if cost is NaN or Inf (indicates bad parameters)
+            if np.isnan(cost_value) or np.isinf(cost_value):
+                return float('inf')
 
-                     if not isinstance(initial_cost_tensor, torch.Tensor) or not initial_cost_tensor.ndim == 0:
-                         print(f"\nWarning: Cost function did not return a scalar tensor for initialization. Skipping.")
-                         continue
-
-                     initial_cost = initial_cost_tensor.item() # Get float value
-                     successful_inits += 1
-
-            except Exception as e:
-                 print(f"\nError during cost evaluation for an initialization: {e}. Skipping.")
-                 # Consider logging the full traceback for debugging
-                 # import traceback; traceback.print_exc()
-                 continue # Skip this initialization
-
-            # Update best initial if this initialization is better
-            if ((self.direction == "maximize" and initial_cost > best_initial_cost) or
-                (self.direction == "minimize" and initial_cost < best_initial_cost)):
-                best_initial_cost = initial_cost
-                # Store clones of the tensors that gave the best initial cost
-                best_initial_config_tensors = (phase_init.detach().clone(), amp_init.detach().clone())
-                init_pbar.set_postfix_str(f"Best initial cost {best_initial_cost:.4f}")
-        # --- End Initialization Loop ---
-        init_pbar.close() # Ensure pbar is closed
-
-        if best_initial_config_tensors is None:
-            if not initialization_timeout:
-                print(f"\nNo successful initializations completed out of {self.num_initializations} attempts.")
-            # If timeout happened or no init worked, return None
-            return None
-
-        print(f"\nFound best initial cost: {best_initial_cost:.4f} after {successful_inits} successful evaluations.")
-        print(f"Starting optimization from this configuration...")
-
-        # --- Optimization Phase ---
-        # Start optimization from the best initial configuration tensors
-        phase = best_initial_config_tensors[0].clone().requires_grad_(True)
-        amplitude = best_initial_config_tensors[1].clone().requires_grad_(True)
-
-        # Setup Adam optimizer
-        optimizer = optim.Adam([phase, amplitude], lr=self.learning_rate, betas=self.betas, eps=self.eps)
-
-        best_cost_opt: float = best_initial_cost # Tracks best cost found during optimization steps
-        # Keep track of the best *tensors* found during optimization
-        best_phase_tensor = phase.detach().clone()
-        best_amplitude_tensor = amplitude.detach().clone()
-
-        optimization_timeout = False
-        try:
-            pbar = trange(self.max_iter, desc="Optimization")
-            for i in pbar:
-                if time.time() - start_time > self.timeout:
-                    pbar.close()
-                    print("\nOptimization stopped due to timeout.")
-                    optimization_timeout = True
-                    break
-
-                optimizer.zero_grad()
-
-                # --- Forward pass: Requires simulation & cost_function Autograd compatibility ---
-                # Create a config with the current tensors needing gradients
-                current_config = CoilConfig(phase=phase, amplitude=amplitude)
-                sim_data = simulation(current_config) # Must handle tensors & build graph
-                cost = self.cost_function(sim_data)   # Must return scalar tensor & build graph
-
-                if not isinstance(cost, torch.Tensor) or not cost.ndim == 0:
-                    pbar.close()
-                    print(f"\nError: Cost function did not return a scalar tensor during optimization step {i}. Stopping.")
-                    # Return the best configuration found *before* the error
-                    # Or you could raise an error: raise TypeError(...)
-                    break # Exit optimization loop
-
-                # --- Backward pass ---
-                # If maximizing, negate the cost because optimizers minimize by default
-                loss = -cost if self.direction == "maximize" else cost
-                loss.backward() # Compute gradients
-
-                # --- Optimizer step ---
-                optimizer.step() # Update parameters (phase, amplitude) based on gradients
-
-                # --- Apply constraints AFTER optimizer step ---
-                # Use torch.no_grad() to avoid tracking these constraint operations
-                with torch.no_grad():
-                    # phase % (2 * torch.pi)
-                    phase.data = torch.fmod(phase.data, 2 * torch.pi)
-                    # Ensure phase remains positive [0, 2pi)
-                    phase.data[phase.data < 0] += 2 * torch.pi
-                    # Clamp amplitude [0, 1]
-                    amplitude.data = torch.clamp(amplitude.data, 0, 1)
-
-                # --- Evaluate cost with updated tensors (for tracking best) ---
-                # Re-evaluate cost with the constrained tensors for accurate tracking.
-                # Use no_grad as this evaluation is just for monitoring/selecting the best.
-                with torch.no_grad():
-                    # Create a temporary config with detached tensors
-                    eval_config = CoilConfig(phase=phase.detach().clone(), amplitude=amplitude.detach().clone())
-                    current_sim_data = simulation(eval_config)
-                    current_cost_tensor = self.cost_function(current_sim_data)
-                    current_cost_val = current_cost_tensor.item() # Get float value
-
-                # Update best cost and configuration found during optimization
-                if ((self.direction == "maximize" and current_cost_val > best_cost_opt) or
-                    (self.direction == "minimize" and current_cost_val < best_cost_opt)):
-                    best_cost_opt = current_cost_val
-                    best_phase_tensor = phase.detach().clone()
-                    best_amplitude_tensor = amplitude.detach().clone()
-                    # Postfix shows current cost and best cost found *during* optimization
-                    pbar.set_postfix_str(f"Cost {current_cost_val:.4f} | Best {best_cost_opt:.4f} (*)")
-                else:
-                    pbar.set_postfix_str(f"Cost {current_cost_val:.4f} | Best {best_cost_opt:.4f}")
-                # --- End Evaluation ---
-
-            # --- End Optimization Loop ---
-            if not pbar.disable: # Ensure pbar is closed if loop finishes naturally or breaks
-                pbar.close()
+            return cost_value
 
         except Exception as e:
-            # Ensure pbar is closed in case of exception within the loop
-            if 'pbar' in locals() and not pbar.disable:
-                pbar.close()
-            print(f"\nAn error occurred during optimization: {e}")
-            import traceback # Optional: Print stack trace for debugging
-            traceback.print_exc()
-            # Fall through to finally block to return the best config found *before* the error
+            # print(f"Warning: Error during cost evaluation: {e}")
+            return float('inf') # Return infinity on error
 
-        finally:
-            # --- Finalization ---
-            elapsed_time = time.time() - start_time
-            if optimization_timeout:
-                 print(f"\nTimeout reached after {elapsed_time:.2f}s. Returning best configuration found.")
-            elif 'pbar' in locals() and not pbar.disable and pbar.n < pbar.total:
-                # Loop exited early, not due to timeout (could be error or future convergence check)
-                print(f"\nOptimization loop stopped early at iteration {pbar.n} after {elapsed_time:.2f}s.")
-            else: # Optimization finished max_iter or completed normally
-                 print(f"\nOptimization finished {self.max_iter} iterations in {elapsed_time:.2f}s.")
+    def _compute_numerical_gradient(self, simulation: Simulation, phase_np: np.ndarray, amplitude_np: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """ Computes numerical gradients for phase and amplitude using central differences. """
+        phase_grad = np.zeros_like(phase_np)
+        amp_grad = np.zeros_like(amplitude_np)
 
-            print(f"Best cost found during optimization: {best_cost_opt:.4f}")
+        # Combine parameters for easier iteration
+        params = np.concatenate((phase_np, amplitude_np))
+        grad = np.zeros_like(params)
+        
+        # Calculate base cost once if needed for forward/backward differences
+        base_cost = None 
 
-            # Convert the best tensors back to a CoilConfig with NumPy arrays
-            # (Assuming the rest of the system expects NumPy for the final result)
-            final_config = CoilConfig(
-                phase=best_phase_tensor.cpu().numpy(),
-                amplitude=best_amplitude_tensor.cpu().numpy()
+        for i in range(len(params)):
+            params_plus = params.copy()
+            params_minus = params.copy()
+
+            params_plus[i] += self.grad_epsilon
+            params_minus[i] -= self.grad_epsilon
+
+            cost_plus = self._objective_function(simulation, params_plus[:8], params_plus[8:])
+            cost_minus = self._objective_function(simulation, params_minus[:8], params_minus[8:])
+
+            # Handle cases where cost evaluation returns infinity (use one-sided diff if possible)
+            if np.isinf(cost_plus) or np.isinf(cost_minus):
+                 if base_cost is None: # Calculate base cost only if needed
+                      base_cost = self._objective_function(simulation, params[:8], params[8:])
+                 
+                 if not np.isinf(cost_plus) and not np.isinf(base_cost):
+                     grad[i] = (cost_plus - base_cost) / self.grad_epsilon # Forward difference
+                 elif not np.isinf(cost_minus) and not np.isinf(base_cost):
+                     grad[i] = (base_cost - cost_minus) / self.grad_epsilon # Backward difference
+                 else:
+                     grad[i] = 0 # Cannot compute gradient
+                     # print(f"Warning: Could not compute gradient for param {i} due to Inf cost.")
+            else:
+                 # Central difference
+                 grad[i] = (cost_plus - cost_minus) / (2 * self.grad_epsilon)
+
+        phase_grad = grad[:8]
+        amp_grad = grad[8:]
+
+        # Ensure gradients are finite, replace NaN/Inf with 0
+        phase_grad = np.nan_to_num(phase_grad, nan=0.0, posinf=0.0, neginf=0.0)
+        amp_grad = np.nan_to_num(amp_grad, nan=0.0, posinf=0.0, neginf=0.0)
+
+        return phase_grad, amp_grad
+
+    def optimize(self, simulation: Simulation) -> CoilConfig:
+        start_time = time.time()
+
+        # --- Initialization ---
+        initial_phase = np.random.uniform(0, 2 * np.pi, size=(8,))
+        initial_amplitude = np.ones((8,)) # Start amplitude at 1
+
+        # Convert initial parameters to torch tensors
+        phase = torch.tensor(initial_phase, dtype=torch.float32, device=self.device)
+        amplitude = torch.tensor(initial_amplitude, dtype=torch.float32, device=self.device)
+        # Ensure they require grad for the optimizer state, even if we set .grad manually
+        phase.requires_grad_(True)
+        amplitude.requires_grad_(True)
+
+
+        # Setup Adam optimizer
+        optimizer = torch.optim.Adam([phase, amplitude],
+                                     lr=self.learning_rate,
+                                     betas=self.betas,
+                                     eps=self.eps)
+
+        # --- Initial Evaluation ---
+        best_phase_np = phase.detach().cpu().numpy()
+        best_amplitude_np = amplitude.detach().cpu().numpy()
+        # Use the objective function which handles min/max direction internally
+        best_internal_cost = self._objective_function(simulation, best_phase_np, best_amplitude_np)
+
+        if np.isinf(best_internal_cost):
+             print("Error: Initial configuration yields invalid cost. Returning initial guess.")
+             # Return the initial numpy arrays in a CoilConfig
+             return CoilConfig(phase=initial_phase, amplitude=initial_amplitude)
+
+        # Store the display cost (actual cost according to min/max direction)
+        best_display_cost = -best_internal_cost if self.direction == "maximize" else best_internal_cost
+        print(f"Initial cost: {best_display_cost:.4f}")
+
+
+        # --- Optimization Loop ---
+        pbar = trange(self.max_iter)
+        for i in pbar:
+            if time.time() - start_time > self.timeout:
+                print(f"\nOptimization stopped due to timeout ({self.timeout}s)")
+                break
+
+            # Get current parameters as numpy arrays for gradient calculation
+            current_phase_np = phase.detach().cpu().numpy()
+            current_amplitude_np = amplitude.detach().cpu().numpy()
+
+            # --- Calculate Numerical Gradients ---
+            phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
+                simulation, current_phase_np, current_amplitude_np
             )
-            return final_config
+
+            # --- Manually Assign Gradients to Tensors ---
+            with torch.no_grad(): # Ensure this operation isn't tracked
+                phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
+                amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+
+            # --- Optimizer Step ---
+            # Checks if gradients exist before stepping
+            if phase.grad is not None and amplitude.grad is not None:
+                optimizer.step() # Apply Adam update using the manually assigned gradients
+            else:
+                print(f"\nWarning: Gradients are None at iter {i}. Skipping optimizer step.")
+
+            # Zero gradients *after* the step for the next iteration
+            optimizer.zero_grad()
+
+            # --- Apply Constraints to Tensors ---
+            # Apply constraints directly to the tensors after the optimizer step
+            with torch.no_grad():
+                phase.data = torch.remainder(phase.data, 2 * np.pi)
+                amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
+
+            # --- Evaluate Current Cost and Update Best ---
+            # Evaluate with the parameters *after* step and constraints
+            eval_phase_np = phase.detach().cpu().numpy()
+            eval_amplitude_np = amplitude.detach().cpu().numpy()
+            current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
+
+            if current_internal_cost < best_internal_cost:
+                best_internal_cost = current_internal_cost
+                best_phase_np = eval_phase_np.copy()      # Store the best numpy arrays
+                best_amplitude_np = eval_amplitude_np.copy()
+
+                # Update display cost
+                best_display_cost = -best_internal_cost if self.direction == "maximize" else best_internal_cost
+                # Optionally calculate grad norm for display
+                current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np)))
+                pbar.set_postfix_str(f"Best cost {best_display_cost:.4f}, Grad norm {current_grad_norm:.2e}")
+
+
+        # --- Return Best Found Configuration ---
+        print(f"\nOptimization finished. Best cost found: {best_display_cost:.4f}")
+
+        # Final check for NaNs in results (should be less likely with constraints)
+        if np.isnan(best_phase_np).any() or np.isnan(best_amplitude_np).any():
+             print("Warning: Best parameters contain NaN. Returning initial guess.")
+             return CoilConfig(phase=initial_phase, amplitude=initial_amplitude)
+
+        return CoilConfig(phase=best_phase_np, amplitude=best_amplitude_np)
