@@ -189,10 +189,10 @@ class AdamTorchOptimizer(BaseOptimizer):
             amplitude = torch.tensor(best_initial_amplitude_np_cycle, dtype=torch.float32, device=self.device, requires_grad=True)
 
             # Setup Adam optimizer for this cycle
-        optimizer = torch.optim.Adam([phase, amplitude],
-                                     lr=self.learning_rate,
-                                     betas=self.betas,
-                                     eps=self.eps)
+            optimizer = torch.optim.Adam([phase, amplitude],
+                                         lr=self.learning_rate,
+                                         betas=self.betas,
+                                         eps=self.eps)
 
             # Track best cost found *during this cycle's optimization run*
             # Initialize with the cost of the starting point for this cycle
@@ -203,58 +203,58 @@ class AdamTorchOptimizer(BaseOptimizer):
             optimization_timed_out_cycle = False
             try:
                 pbar = trange(self.max_iter, desc=f"Cycle {outer_run_count} Opt Run", leave=False)
-        for i in pbar:
+                for i in pbar:
                     # Check overall timeout at the start of each iteration
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred during optimization step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
-                break
+                        break # Exit inner loop
 
                     # Get current parameters as numpy arrays
-            current_phase_np = phase.detach().cpu().numpy()
-            current_amplitude_np = amplitude.detach().cpu().numpy()
+                    current_phase_np = phase.detach().cpu().numpy()
+                    current_amplitude_np = amplitude.detach().cpu().numpy()
 
-            # --- Calculate Numerical Gradients ---
-            phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
-                simulation, current_phase_np, current_amplitude_np
-            )
+                    # --- Calculate Numerical Gradients ---
+                    phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
+                        simulation, current_phase_np, current_amplitude_np
+                    )
                     # Check timeout *after* gradient calculation
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred after gradient calc in step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
-                        break
+                        break # Exit inner loop
 
-            # --- Manually Assign Gradients to Tensors ---
+                    # --- Manually Assign Gradients to Tensors ---
                     with torch.no_grad():
-                phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
-                amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+                        phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
+                        amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
 
-            # --- Optimizer Step ---
-            if phase.grad is not None and amplitude.grad is not None:
+                    # --- Optimizer Step ---
+                    if phase.grad is not None and amplitude.grad is not None:
                         optimizer.step() # Apply Adam update
-            else:
+                    else:
                         print(f"\nWarning: Gradients are None at iter {i} in cycle {outer_run_count}. Skipping optimizer step.")
 
                     # Zero gradients *after* the step
-            optimizer.zero_grad()
+                    optimizer.zero_grad()
 
-            # --- Apply Constraints to Tensors ---
-            with torch.no_grad():
-                phase.data = torch.remainder(phase.data, 2 * np.pi)
-                amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
+                    # --- Apply Constraints to Tensors ---
+                    with torch.no_grad():
+                        phase.data = torch.remainder(phase.data, 2 * np.pi)
+                        amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
 
                     # --- Evaluate Current Cost and Update Cycle Best ---
-            eval_phase_np = phase.detach().cpu().numpy()
-            eval_amplitude_np = amplitude.detach().cpu().numpy()
-            current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
+                    eval_phase_np = phase.detach().cpu().numpy()
+                    eval_amplitude_np = amplitude.detach().cpu().numpy()
+                    current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
                     # Check timeout *after* cost evaluation
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred after cost eval in step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
-                        break
+                        break # Exit inner loop
 
                     # Update the best cost found *during this cycle's run*
                     if initial_cost_better(current_internal_cost, run_best_internal_cost_cycle):
