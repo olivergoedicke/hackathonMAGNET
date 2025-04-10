@@ -3,7 +3,7 @@
 import torch
 import numpy as np
 import time
-from tqdm import trange
+from tqdm import trange, tqdm
 
 from ..data.simulation import Simulation
 from ..data.dataclasses import CoilConfig
@@ -202,13 +202,28 @@ class AdamTorchOptimizer(BaseOptimizer):
             # --- Optimization Loop (for this cycle) ---
             optimization_timed_out_cycle = False
             try:
-                pbar = trange(self.max_iter, desc=f"Cycle {outer_run_count} Opt Run", leave=False)
-                for i in pbar:
+                i = 0
+                cost_history = {}
+                continue_optimizing = True
+                max_total_cycle_iter = self.max_iter * 2 # Hard limit to prevent excessive time in one cycle
+                progress_check_threshold = 0.15
+                min_iters_before_progress_check = 5
+
+                pbar = tqdm(desc=f"Cycle {outer_run_count} Opt Run", leave=False) # Manual updates
+
+                while continue_optimizing:
+                    # --- Check termination conditions --- +
+                    # Hard iteration limit
+                    if i >= max_total_cycle_iter:
+                        print(f"  Reached max cycle iteration limit ({max_total_cycle_iter}). Stopping cycle optimization.")
+                        continue_optimizing = False
+                        break
+
                     # Check overall timeout at the start of each iteration
                     if time.time() - overall_start_time >= self.timeout:
-                        pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred during optimization step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
+                        continue_optimizing = False
                         break # Exit inner loop
 
                     # Get current parameters as numpy arrays
@@ -221,9 +236,9 @@ class AdamTorchOptimizer(BaseOptimizer):
                     )
                     # Check timeout *after* gradient calculation
                     if time.time() - overall_start_time >= self.timeout:
-                        pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred after gradient calc in step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
+                        continue_optimizing = False
                         break # Exit inner loop
 
                     # --- Manually Assign Gradients to Tensors ---
@@ -251,10 +266,13 @@ class AdamTorchOptimizer(BaseOptimizer):
                     current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
                     # Check timeout *after* cost evaluation
                     if time.time() - overall_start_time >= self.timeout:
-                        pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred after cost eval in step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
+                        continue_optimizing = False
                         break # Exit inner loop
+
+                    # Store cost for progress checking
+                    cost_history[i] = current_internal_cost
 
                     # Update the best cost found *during this cycle's run*
                     if initial_cost_better(current_internal_cost, run_best_internal_cost_cycle):
@@ -266,9 +284,23 @@ class AdamTorchOptimizer(BaseOptimizer):
                         current_grad_norm = np.linalg.norm(np.concatenate((phase_grad_np, amp_grad_np))) if phase_grad_np is not None and amp_grad_np is not None else float('nan')
                         pbar.set_postfix_str(f"Cycle best cost {run_best_display_cost_cycle:.4f}, Grad norm {current_grad_norm:.2e}")
 
+                    # --- Check for slow progress --- +
+                    if i >= min_iters_before_progress_check:
+                        cost_comp_iter = i - min_iters_before_progress_check
+                        cost_past = cost_history.get(cost_comp_iter)
+                        if cost_past is not None:
+                            progress = abs(current_internal_cost - cost_past)
+                            if progress <= progress_check_threshold:
+                                print(f"  Progress slowed below threshold ({progress:.4f} <= {progress_check_threshold}) between iter {cost_comp_iter+1} and {i+1}. Stopping cycle optimization.")
+                                continue_optimizing = False # Will stop the loop on next check
+                        # else: not enough history yet, continue
+
+                    pbar.update(1) # Manual update
+                    i += 1 # Increment iteration counter
+
                 # End of optimization loop (max_iter or timeout break)
                 if not pbar.disable:
-                     pbar.close()
+                    pbar.close()
 
             except TimeoutError as e: # Should be caught by inner checks, but as safety
                 print(f"\nTimeoutError during optimization run of cycle {outer_run_count}: {str(e)}")
