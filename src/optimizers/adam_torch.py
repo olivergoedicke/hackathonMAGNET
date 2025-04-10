@@ -4,38 +4,11 @@ import torch
 import numpy as np
 import time
 from tqdm import trange
-import multiprocessing
-from functools import partial
 
 from ..data.simulation import Simulation
 from ..data.dataclasses import CoilConfig
 from ..costs.base import BaseCost
 from .base import BaseOptimizer
-
-# Helper function for parallel execution (must be defined at the top level for pickling)
-def _evaluate_config_parallel(simulation: Simulation, cost_function: BaseCost, direction: str, phase_np: np.ndarray, amplitude_np: np.ndarray) -> float:
-    """ Evaluates a single coil configuration. Returns internal cost (minimization sense). """
-    try:
-        # Apply constraints before evaluation
-        phase_np_constrained = np.mod(phase_np, 2 * np.pi)
-        amplitude_np_constrained = np.clip(amplitude_np, 0, 1)
-
-        config = CoilConfig(phase=phase_np_constrained, amplitude=amplitude_np_constrained)
-        cost = cost_function(simulation(config)) # Assumes cost_function and simulation are picklable
-
-        cost_value = float(cost) # Ensure standard float
-        if direction == "maximize":
-            cost_value = -cost_value # Convert to minimization sense internally
-
-        # Return infinity if cost is NaN or Inf (indicates bad parameters)
-        if np.isnan(cost_value) or np.isinf(cost_value):
-            return float('inf')
-
-        return cost_value
-
-    except Exception as e:
-        # print(f"Warning: Error during parallel cost evaluation: {e}")
-        return float('inf') # Return infinity on error
 
 class AdamTorchOptimizer(BaseOptimizer):
     """
@@ -155,74 +128,50 @@ class AdamTorchOptimizer(BaseOptimizer):
         while time.time() - overall_start_time < self.timeout:
             outer_run_count += 1
             print(f"--- Outer Optimization Cycle {outer_run_count} ---")
-
-            # Check timeout before starting cycle
-            if time.time() - overall_start_time >= self.timeout:
-                print("Timeout reached before starting new cycle.")
-                break
-
-            cycle_start_time = time.time() # Start timer for cycle duration reporting
+            cycle_start_time = time.time()
 
             # --- Initial Configuration Evaluation (for this cycle) ---+
             best_initial_config_np_cycle = None
             best_initial_internal_cost_cycle = float('inf')
 
-            print(f"  Generating {self.num_inits} random configurations for cycle {outer_run_count}...")
-            # 1. Generate all configurations first
-            initial_configs = [
-                (np.random.uniform(0, 2 * np.pi, size=(8,)), np.random.uniform(0, 1, size=(8,)))
-                for _ in range(self.num_inits)
-            ]
-
-            print(f"  Evaluating {self.num_inits} configurations in parallel...")
+            print(f"  Evaluating {self.num_inits} initial random configurations for cycle {outer_run_count}...")
+            pbar_init = trange(self.num_inits, desc=f"Cycle {outer_run_count} Init Eval", leave=False)
             initial_eval_timed_out_cycle = False
-            results = []
-            try:
-                # 2. Use multiprocessing pool
-                # Consider specifying processes=... if needed, defaults to os.cpu_count()
-                with multiprocessing.Pool() as pool:
-                    # Use partial to fix the simulation, cost_function, and direction args
-                    eval_func_partial = partial(_evaluate_config_parallel, simulation, self.cost_function, self.direction)
+            for _ in pbar_init:
+                # Check overall timeout *before* evaluation
+                if time.time() - overall_start_time >= self.timeout:
+                    pbar_init.close()
+                    print(f"\nTimeout ({self.timeout}s) occurred during initial evaluation of cycle {outer_run_count}.")
+                    initial_eval_timed_out_cycle = True
+                    break
 
-                    # Map the function over the generated phase/amplitude pairs
-                    # starmap unpacks the tuple arguments for the function
-                    results = pool.starmap(eval_func_partial, initial_configs)
+                # Generate random configuration (NumPy)
+                initial_phase_np = np.random.uniform(0, 2 * np.pi, size=(8,))
+                initial_amplitude_np = np.random.uniform(0, 1, size=(8,))
 
-            except Exception as e:
-                 print(f"Error during parallel initial evaluation: {e}")
-                 # Decide how to handle this - skip cycle? stop? For now, skip cycle.
-                 if time.time() - overall_start_time >= self.timeout: break
-                 continue
+                # Evaluate its cost
+                try:
+                    current_initial_internal_cost = self._objective_function(simulation, initial_phase_np, initial_amplitude_np)
 
-            # Check timeout *after* parallel execution finishes
-            if time.time() - overall_start_time >= self.timeout:
-                print(f"\nTimeout ({self.timeout}s) occurred during parallel initial evaluation of cycle {outer_run_count}.")
-                initial_eval_timed_out_cycle = True
-                break # Break outer while loop
+                    if initial_cost_better(current_initial_internal_cost, best_initial_internal_cost_cycle):
+                        best_initial_internal_cost_cycle = current_initial_internal_cost
+                        best_initial_config_np_cycle = (initial_phase_np, initial_amplitude_np)
+                        # Display actual cost based on direction for this cycle's best init
+                        best_initial_display_cost_cycle = -best_initial_internal_cost_cycle if self.direction == "maximize" else best_initial_internal_cost_cycle
+                        pbar_init.set_postfix_str(f"Best init cost {best_initial_display_cost_cycle:.4f}")
 
-            # 3. Process results
-            print(f"  Processing {len(results)} evaluation results...")
-            for i, internal_cost in enumerate(results):
-                 if internal_cost < best_initial_internal_cost_cycle:
-                    best_initial_internal_cost_cycle = internal_cost
-                    best_initial_config_np_cycle = initial_configs[i] # Store the corresponding (phase, amp) tuple
+                except Exception as e:
+                    # print(f"Warning: Error evaluating initial config in cycle {outer_run_count}: {e}")
+                    pass # Continue to next initial config
 
-            # Print the best initial cost found in this parallel batch
-            if best_initial_config_np_cycle is not None:
-                best_initial_display_cost_cycle = -best_initial_internal_cost_cycle if self.direction == "maximize" else best_initial_internal_cost_cycle
-                print(f"  Best initial cost found in cycle {outer_run_count}: {best_initial_display_cost_cycle:.4f}")
-            else:
-                 # This case happens if all evaluations failed or returned Inf
-                 pass # The check below handles this
+            if not pbar_init.disable:
+                 pbar_init.close()
 
-            # Check if timeout occurred during results processing (unlikely but possible)
-            if time.time() - overall_start_time >= self.timeout:
-                 print(f"\nTimeout ({self.timeout}s) occurred processing initial evaluation results of cycle {outer_run_count}.")
-                 initial_eval_timed_out_cycle = True
-                 break # Break outer while loop
+            # If timeout occurred during initial eval, break the outer loop
+            if initial_eval_timed_out_cycle:
+                break
 
-            # If no valid initial point found (or timeout occurred before finding one)
-            if best_initial_config_np_cycle is None: # Also handles the case where timeout occurred
+            if best_initial_config_np_cycle is None:
                 print(f"\nWarning: Failed to find any valid initial configuration in cycle {outer_run_count}. Skipping to next cycle.")
                 # Check timeout before continuing to potentially avoid infinite loop if objective always fails
                 if time.time() - overall_start_time >= self.timeout:
@@ -240,10 +189,10 @@ class AdamTorchOptimizer(BaseOptimizer):
             amplitude = torch.tensor(best_initial_amplitude_np_cycle, dtype=torch.float32, device=self.device, requires_grad=True)
 
             # Setup Adam optimizer for this cycle
-            optimizer = torch.optim.Adam([phase, amplitude],
-                                         lr=self.learning_rate,
-                                         betas=self.betas,
-                                         eps=self.eps)
+        optimizer = torch.optim.Adam([phase, amplitude],
+                                     lr=self.learning_rate,
+                                     betas=self.betas,
+                                     eps=self.eps)
 
             # Track best cost found *during this cycle's optimization run*
             # Initialize with the cost of the starting point for this cycle
@@ -254,22 +203,22 @@ class AdamTorchOptimizer(BaseOptimizer):
             optimization_timed_out_cycle = False
             try:
                 pbar = trange(self.max_iter, desc=f"Cycle {outer_run_count} Opt Run", leave=False)
-                for i in pbar:
+        for i in pbar:
                     # Check overall timeout at the start of each iteration
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
                         print(f"\nTimeout ({self.timeout}s) occurred during optimization step {i} of cycle {outer_run_count}.")
                         optimization_timed_out_cycle = True
-                        break
+                break
 
                     # Get current parameters as numpy arrays
-                    current_phase_np = phase.detach().cpu().numpy()
-                    current_amplitude_np = amplitude.detach().cpu().numpy()
+            current_phase_np = phase.detach().cpu().numpy()
+            current_amplitude_np = amplitude.detach().cpu().numpy()
 
-                    # --- Calculate Numerical Gradients ---
-                    phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
-                        simulation, current_phase_np, current_amplitude_np
-                    )
+            # --- Calculate Numerical Gradients ---
+            phase_grad_np, amp_grad_np = self._compute_numerical_gradient(
+                simulation, current_phase_np, current_amplitude_np
+            )
                     # Check timeout *after* gradient calculation
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
@@ -277,29 +226,29 @@ class AdamTorchOptimizer(BaseOptimizer):
                         optimization_timed_out_cycle = True
                         break
 
-                    # --- Manually Assign Gradients to Tensors ---
+            # --- Manually Assign Gradients to Tensors ---
                     with torch.no_grad():
-                        phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
-                        amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
+                phase.grad = torch.tensor(phase_grad_np, dtype=torch.float32, device=self.device)
+                amplitude.grad = torch.tensor(amp_grad_np, dtype=torch.float32, device=self.device)
 
-                    # --- Optimizer Step ---
-                    if phase.grad is not None and amplitude.grad is not None:
+            # --- Optimizer Step ---
+            if phase.grad is not None and amplitude.grad is not None:
                         optimizer.step() # Apply Adam update
-                    else:
+            else:
                         print(f"\nWarning: Gradients are None at iter {i} in cycle {outer_run_count}. Skipping optimizer step.")
 
                     # Zero gradients *after* the step
-                    optimizer.zero_grad()
+            optimizer.zero_grad()
 
-                    # --- Apply Constraints to Tensors ---
-                    with torch.no_grad():
-                        phase.data = torch.remainder(phase.data, 2 * np.pi)
-                        amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
+            # --- Apply Constraints to Tensors ---
+            with torch.no_grad():
+                phase.data = torch.remainder(phase.data, 2 * np.pi)
+                amplitude.data = torch.clamp(amplitude.data, 0.0, 1.0)
 
                     # --- Evaluate Current Cost and Update Cycle Best ---
-                    eval_phase_np = phase.detach().cpu().numpy()
-                    eval_amplitude_np = amplitude.detach().cpu().numpy()
-                    current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
+            eval_phase_np = phase.detach().cpu().numpy()
+            eval_amplitude_np = amplitude.detach().cpu().numpy()
+            current_internal_cost = self._objective_function(simulation, eval_phase_np, eval_amplitude_np)
                     # Check timeout *after* cost evaluation
                     if time.time() - overall_start_time >= self.timeout:
                         pbar.close()
