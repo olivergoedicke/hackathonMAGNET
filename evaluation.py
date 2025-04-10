@@ -21,8 +21,8 @@ Available optimizers (configured in main.py):
 
 if __name__ == "__main__":
     # Load simulation data
-    simulation_file = "src/data/simulations/children_0_tubes_2_id_19969.h5"
-    coil_file = "src/data/antenna/antenna.h5"
+    simulation_file = "data/simulations/children_1_tubes_2_id_23848.h5"
+    coil_file = "data/antenna/antenna.h5"
     
     # Create simulation object with correct paths
     simulation = Simulation(
